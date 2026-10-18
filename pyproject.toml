@@ -1,0 +1,17 @@
+[project]
+name = "serser"
+version = "0.1.0"
+description = "Concurrent multi-serial-port reader with timestamped output"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pyserial-asyncio>=0.6",
+    "textual>=4.0",
+]
+
+[project.scripts]
+serser = "serser.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
