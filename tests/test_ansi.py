@@ -19,7 +19,7 @@ def collect(chunks, parser=None):
     asm = LineAssembler(FakePort(), ">", out.append)
     for c in chunks:
         asm.feed_bytes(c if isinstance(c, bytes) else c.encode())
-    asm.flush()
+    asm.finish()
     return [(l.text, tuple((s, e, str(st)) for s, e, st in l.spans)) for l in out]
 
 
@@ -62,7 +62,7 @@ class DecoderTests(unittest.TestCase):
                         for _ in range(n))
             asm.feed_bytes(raw)
         asm.feed_bytes(b"\x1b]" + b"x" * 100000 + b"\n" + b"y" * 20000 + b"\n")
-        asm.flush()
+        asm.finish()
         self.assertTrue(asm_out)
         for l in asm_out:
             self.assertLessEqual(len(l.text), MAX_LINE)
@@ -78,27 +78,69 @@ class OutputFileTests(unittest.TestCase):
         from serser.main import OutputFile
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "log.txt")
-            out = []
-            asm = LineAssembler(FakePort(), ">", out.append)
-            asm.feed_bytes(b"\x1b[31ma\r\nb\n")
-            asm.flush()
             f = OutputFile(path, 1, hold=0)
-            for l in out:
-                f.add(l)
+            asm = LineAssembler(FakePort(), ">", f.add, f.add_raw)
+            asm.feed_bytes(b"\x1b[31ma\r\nb\n")
+            asm.finish()
             f.close()
-            data = json.load(open(os.path.join(d, "log.json")))
+            with open(os.path.join(d, "log.json")) as fh:
+                data = json.load(fh)
             self.assertEqual("".join(e["data"] for e in data), "\x1b[31ma\r\nb\n")
             self.assertEqual(data[0]["direction"], "rx")
-            lines = open(path).read().splitlines()
+            with open(path) as fh:
+                lines = fh.read().splitlines()
             self.assertEqual([l.split(" ", 2)[2] for l in lines], ["P> a", "P> b"])
-            with self.assertRaises(FileExistsError):
-                OutputFile(path, 1)
-            os.remove(path)
-            with self.assertRaises(FileExistsError):
-                OutputFile(path, 1)
-            self.assertFalse(os.path.exists(path))
+            # a second run appends, keeping the JSON array valid
+            f = OutputFile(path, 1, hold=0)
+            asm = LineAssembler(FakePort(), "<", f.add, f.add_raw)
+            asm.feed_bytes(b"c\n")
+            asm.finish()
+            f.close()
+            with open(os.path.join(d, "log.json")) as fh:
+                data = json.load(fh)
+            self.assertEqual([e["data"] for e in data], ["\x1b[31ma\r\n", "b\n", "c\n"])
+            with open(path) as fh:
+                self.assertEqual(len(fh.read().splitlines()), 3)
+            # an empty run leaves an empty array; unclosed arrays are continued
+            for body, n in (("", 1), ("[]", 1), ("[\n]\n", 1),
+                            ('[\n  {"data": "x"}', 2), ('[\n  {"data": "x"}\n]\n', 2)):
+                with open(os.path.join(d, "t.json"), "w") as fh:
+                    fh.write(body)
+                f = OutputFile(os.path.join(d, "t.txt"), 1, hold=0)
+                asm = LineAssembler(FakePort(), ">", f.add, f.add_raw)
+                asm.feed_bytes(b"c\n")
+                asm.finish()
+                f.close()
+                with open(os.path.join(d, "t.json")) as fh:
+                    self.assertEqual(len(json.load(fh)), n, body)
+            with open(os.path.join(d, "t.json"), "w") as fh:
+                fh.write("hello")
+            with self.assertRaises(ValueError):
+                OutputFile(os.path.join(d, "t.txt"), 1)
             with self.assertRaises(ValueError):
                 OutputFile(os.path.join(d, "x.json"), 1)
+
+
+class RawTailTests(unittest.TestCase):
+    def raws(self, chunks, times=None):
+        from datetime import datetime, timedelta, timezone
+        out = []
+        asm = LineAssembler(FakePort(), ">", lambda l: None, lambda ts, p, a, d: out.append(d))
+        t = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        for i, c in enumerate(chunks):
+            asm.feed_bytes(c, now=t + timedelta(seconds=(times[i] if times else 0)))
+        asm.finish()
+        return out
+
+    def test_trailing_breaks_join_previous_line(self):
+        self.assertEqual(self.raws([b"ets\r", b"\n\r\nrst\r"]), ["ets\r\n\r\n", "rst\r"])
+        self.assertEqual(self.raws([b"a\r\n\n\nb\n"]), ["a\r\n\n\n", "b\n"])
+
+    def test_gap_starts_new_burst(self):
+        self.assertEqual(self.raws([b"a\n", b"\nb\n"], [0, 1]), ["a\n", "\nb\n"])
+
+    def test_escape_only_line_kept(self):
+        self.assertEqual(self.raws([b"\x1b[2J\nx\n"]), ["\x1b[2J\n", "x\n"])
 
 
 class TimingTests(unittest.TestCase):
@@ -108,7 +150,7 @@ class TimingTests(unittest.TestCase):
         asm = LineAssembler(FakePort(), ">", out.append)
         now = datetime(2025, 1, 1, tzinfo=timezone.utc)
         asm.feed_bytes(b"\x1b[31mA\n", now=now, byte_time=0.001)
-        asm.flush()
+        asm.finish()
         # 6 bytes before the newline: the line starts 6 bytes before 'now'.
         self.assertLess(out[0].ts, now)
 

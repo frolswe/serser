@@ -6,6 +6,7 @@ import asyncio
 import bisect
 import codecs
 import heapq
+import io
 import os
 import platform as _platform_mod
 import re
@@ -234,7 +235,7 @@ def parse_args() -> argparse.Namespace:
                    help="Save all traffic of all ports (also disabled ones): plain text "
                         "with full timestamps to FILE, and an array of {timestamp, port, "
                         "direction, data} with the raw text to FILE with its extension replaced "
-                        "by .json. Refuses to overwrite existing files.")
+                        "by .json. Existing files are appended to.")
     p.add_argument("--color", choices=("auto", "always", "never"), default="auto",
                    help="Colour for piped output: 'always' prints the decoded device "
                         "colours as ANSI; otherwise plain text. The TUI always uses colour.")
@@ -255,7 +256,6 @@ class LogLine:
     arrow: str
     text: str
     spans: tuple[Span, ...] = ()
-    raw: str = ""
 
     @classmethod
     def status(cls, text: str, style: str | None = None) -> "LogLine":
@@ -288,7 +288,7 @@ class LineAssembler:
     end a line.
     """
 
-    def __init__(self, port: SerialPort, arrow: str, emit) -> None:
+    def __init__(self, port: SerialPort, arrow: str, emit, emit_raw=None) -> None:
         self.port_name = port.name
         self.arrow = arrow
         self.timeout = port.silence_timeout
@@ -300,6 +300,11 @@ class LineAssembler:
         self._last: datetime | None = None
         self._busy_until: datetime | None = None
         self._raw: list[str] = []
+        # Raw record (ts, text) of the last line, kept open until the silence gap
+        # so that line breaks following it can be appended before it is emitted.
+        self._emit_raw = emit_raw
+        self._pending: tuple[datetime, list[str]] | None = None
+        self._timer: asyncio.TimerHandle | None = None
 
     def feed_bytes(self, raw: bytes, now: datetime | None = None,
                    byte_time: float = 0.0) -> None:
@@ -327,6 +332,7 @@ class LineAssembler:
             self.flush()
             self.parser.abort()
             self._decoder.reset()
+            self._finalize()
         self._last = now
         seg = 0  # start of the part of *text* not yet added to the raw line
         for i, op, a, b in self.parser.feed(text):
@@ -336,6 +342,7 @@ class LineAssembler:
                 self.flush()
                 continue
             if self._ts is None:
+                self._finalize()
                 off = offsets[i]
                 if forward:
                     self._ts = start + timedelta(seconds=off * byte_time)
@@ -353,14 +360,47 @@ class LineAssembler:
             self._raw = ["".join(self._raw)[-65536:]]
 
     def flush(self) -> None:
-        if len(self.buf) and self._ts is not None:
-            text, spans = self.buf.to_text()
-            if text:
-                self._emit_cb(LogLine(self._ts, self.port_name, self.arrow, text, spans,
-                                      "".join(self._raw)))
-                self._raw = []
+        if self._ts is not None:
+            if len(self.buf):
+                text, spans = self.buf.to_text()
+                if text:
+                    self._emit_cb(LogLine(self._ts, self.port_name, self.arrow, text, spans))
+            self._finalize()
+            self._pending = (self._ts, self._raw)
+            self._raw = []
+            self._arm_timer()
+        elif self._pending is not None and self._raw:
+            # Further line breaks right after a line belong to that line's raw data.
+            self._pending[1].extend(self._raw)
+            self._raw = []
+            self._arm_timer()
         self.buf.clear()
         self._ts = None
+
+    def finish(self) -> None:
+        """Flush the line being built and emit the pending raw record."""
+        self.flush()
+        self._finalize()
+
+    def _finalize(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        if self._pending is not None:
+            ts, raw = self._pending
+            self._pending = None
+            if self._emit_raw is not None:
+                self._emit_raw(ts, self.port_name, self.arrow, "".join(raw))
+
+    def _arm_timer(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        if self._emit_raw is not None:
+            try:
+                self._timer = asyncio.get_running_loop().call_later(self.timeout, self._finalize)
+            except RuntimeError:  # no event loop (plain use in tests)
+                pass
 
 
 async def ordered_lines(q: "asyncio.Queue[LogLine]", hold: float = 0.25):
@@ -461,7 +501,44 @@ class OutputFile:
     replaced by ``.json`` gets the
     raw data as a JSON array. Lines are held briefly and written sorted by
     timestamp, so back-dated received lines land in order (UTC timestamps).
+    Existing files are appended to; an existing JSON array stays valid.
     """
+
+    @staticmethod
+    def _open_json(path: str):
+        """Open *path* for appending entries to its JSON array.
+
+        Returns (file, first) where *first* is True if the array is empty. An
+        array closed with ``]`` is reopened by cutting that bracket; one left
+        unclosed (killed run) is continued as is.
+        """
+        f = open(path, "a+b")
+        try:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(0)
+            head = f.read(4096).lstrip()
+            if not head:
+                f.truncate(0)
+                f.write(b"[")
+                return f, True
+            if not head.startswith(b"["):
+                raise ValueError(f"{path} is not a JSON array")
+            f.seek(max(0, size - 4096))
+            tail = f.read()
+            body = tail.rstrip()
+            if body.endswith(b"]"):
+                body = body[:-1].rstrip()
+            if body.endswith(b"["):
+                first = True
+            elif body.endswith(b"}"):
+                first = False
+            else:
+                raise ValueError(f"{path} is not a JSON array of entries")
+            f.truncate(size - len(tail) + len(body))
+            return f, first
+        except BaseException:
+            f.close()
+            raise
 
     def __init__(self, path: str, name_width: int, hold: float = 0.5) -> None:
         self.width = name_width
@@ -469,47 +546,43 @@ class OutputFile:
         json_path = os.path.splitext(path)[0] + ".json"
         if os.path.abspath(json_path) == os.path.abspath(path):
             raise ValueError("FILE must not end in .json (that name is used for the JSON output)")
-        self._txt = open(path, "x", encoding="utf-8", newline="\n")  # refuses to overwrite
-        try:
-            self._json = open(json_path, "x", encoding="utf-8", newline="\n")
-        except BaseException:
-            self._txt.close()
-            os.remove(path)
-            raise
+        raw_json, self._first = self._open_json(json_path)
+        self._json = io.TextIOWrapper(raw_json, encoding="utf-8", newline="\n")
+        self._txt = open(path, "a", encoding="utf-8", newline="\n")
         self._heap: list[tuple[datetime, int, float, LogLine]] = []
+        self._raw_heap: list[tuple[datetime, int, float, str, str, str]] = []
         self._seq = 0
-        self._first = True
-        self._json.write("[")
 
     def add(self, line: LogLine) -> None:
         self._seq += 1
         key = line.ts or datetime.now(timezone.utc)
         heapq.heappush(self._heap, (key, self._seq, time.monotonic(), line))
 
+    def add_raw(self, ts: datetime, port: str, arrow: str, data: str) -> None:
+        self._seq += 1
+        heapq.heappush(self._raw_heap, (ts, self._seq, time.monotonic(), port, arrow, data))
+
     def write_due(self, force: bool = False) -> None:
         now = time.monotonic()
         wrote = False
         while self._heap and (force or self._heap[0][2] + self.hold <= now):
             key, _, _, line = heapq.heappop(self._heap)
-            self._write(key, line)
+            stamp = key.strftime("%Y-%m-%d %H:%M:%S.") + f"{key.microsecond // 1000:03d}"
+            head = f"{line.port.ljust(self.width)}{line.arrow} " if line.port else ""
+            self._txt.write(f"{stamp} {head}{line.text}\n")
+            wrote = True
+        while self._raw_heap and (force or self._raw_heap[0][2] + self.hold <= now):
+            key, _, _, port, arrow, data = heapq.heappop(self._raw_heap)
+            import json
+            entry = {"timestamp": key.isoformat(timespec="microseconds"), "port": port,
+                     "direction": "rx" if arrow == ">" else "tx", "data": data}
+            self._json.write(("\n" if self._first else ",\n") + "  "
+                             + json.dumps(entry, ensure_ascii=False))
+            self._first = False
             wrote = True
         if wrote:
             self._txt.flush()
             self._json.flush()
-
-    def _write(self, key: datetime, line: LogLine) -> None:
-        stamp = key.strftime("%Y-%m-%d %H:%M:%S.") + f"{key.microsecond // 1000:03d}"
-        head = f"{line.port.ljust(self.width)}{line.arrow} " if line.port else ""
-        self._txt.write(f"{stamp} {head}{line.text}\n")
-        if line.ts is not None:  # status lines are not traffic
-            import json
-            entry = {"timestamp": key.isoformat(timespec="microseconds"),
-                     "port": line.port,
-                     "direction": "rx" if line.arrow == ">" else "tx",
-                     "data": line.raw}
-            self._json.write(("\n" if self._first else ",\n") + "  "
-                             + json.dumps(entry, ensure_ascii=False))
-            self._first = False
 
     def close(self) -> None:
         if self._txt.closed:
@@ -532,6 +605,7 @@ async def _run_reader(
     port: SerialPort, 
     out_q: "asyncio.Queue[LogLine]",
     transports: dict[str, asyncio.BaseTransport] | None = None,
+    emit_raw=None,
 ) -> asyncio.Transport | None:
     """Open *port*, push timestamped lines to *out_q* until cancelled.
 
@@ -543,7 +617,7 @@ async def _run_reader(
     class _ReadProto(asyncio.Protocol):
         def __init__(self) -> None:
             self.transport: asyncio.BaseTransport | None = None
-            self.rx = LineAssembler(port, ">", out_q.put_nowait)
+            self.rx = LineAssembler(port, ">", out_q.put_nowait, emit_raw)
 
         def connection_made(self, transport) -> None:  # type: ignore[override]
             self.transport = transport
@@ -599,7 +673,8 @@ async def _run_non_tty(ports_cfg: list[SerialPort], color: str = "auto",
     """
     out_q: "asyncio.Queue[LogLine]" = asyncio.Queue()
     width = max((len(p.name) for p in ports_cfg), default=0)
-    reader_tasks = [asyncio.create_task(_run_reader(p, out_q)) for p in ports_cfg]
+    raw_sink = out_file.add_raw if out_file is not None else None
+    reader_tasks = [asyncio.create_task(_run_reader(p, out_q, emit_raw=raw_sink)) for p in ports_cfg]
 
     console = None
     prefix_styles: dict[str, Style] = {}
@@ -866,7 +941,8 @@ Screen { layout: vertical; }
         self._compact = TimeCompactor()
         self._last_vis: tuple[datetime, int, LogLine] | None = None
         self.name_width = max((len(p.name) for p in self.ports), default=0)
-        self.tx = {p.name: LineAssembler(p, "<", self._emit_line) for p in self.ports}
+        self.tx = {p.name: LineAssembler(p, "<", self._emit_line,
+                                    out_file.add_raw if out_file else None) for p in self.ports}
         self._prefix = {p.name: Style.parse(self.mgr.vibrant_style_for(p.name) or "")
                         for p in self.ports}
 
@@ -891,7 +967,8 @@ Screen { layout: vertical; }
         import serial_asyncio as _  # prime the module
         
         for port in self.ports:
-            task = asyncio.create_task(_run_reader(port, self.out_q, self.transport_map))
+            task = asyncio.create_task(_run_reader(port, self.out_q, self.transport_map,
+                                                   self.out_file.add_raw if self.out_file else None))
 
         self.run_worker(self._drain_output())
         if self.out_file is not None:
@@ -1035,10 +1112,8 @@ def main() -> None:
     out_file = None
     if args.output:
         try:
-            out_file = OutputFile(args.output, max((len(p.name) for p in ports_cfg), default=0))
-        except FileExistsError:
-            print("Error: output file or its .json counterpart already exists; refusing to overwrite.", file=sys.stderr)
-            sys.exit(1)
+            out_file = OutputFile(args.output, max((len(p.name) for p in ports_cfg), default=0),
+                                  hold=0.5 + max(p.silence_timeout for p in ports_cfg))
         except (OSError, ValueError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)

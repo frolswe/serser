@@ -69,7 +69,7 @@ serser --default-baud 9600 /dev/ttyS0 /dev/ttyS1
 | `--baud RATE` | `-b` *(repeatable)* | — | Baud rate for ports without inline baud, in order |
 | `--default-baud NUM` | — | `115200` | Fallback baud rate when nothing else is specified |
 | `--gap-ms MS` | — | `50` | Minimum silence that starts a new timestamped line (USB adapters deliver data in chunks) |
-| `--output FILE` | `-o` | — | Save all traffic of all ports (including disabled ones) to `FILE` and to `FILE` with its extension replaced by `.json`; see below. Refuses to overwrite existing files |
+| `--output FILE` | `-o` | — | Save all traffic of all ports (including disabled ones) to `FILE` and to `FILE` with its extension replaced by `.json`; see below. Existing files are appended to |
 | `--color auto\|always\|never` | — | `auto` | Piped output only: `always` prints the decoded device colors as ANSI; otherwise plain text. The TUI always shows colors |
 
 ## Output Format
@@ -104,7 +104,7 @@ Received and sent text is decoded by a per-port ANSI parser (`serser/ansi.py`) a
 
 - Supported: SGR colors and attributes (16/256/truecolor, bold, dim, italic, underline, reverse, strike; blink/conceal ignored), `\b`, tab, and the in-line edits `ESC[nC/D/G`, `K`, `P`, `X`.
 - Color state is kept per port and direction and persists across lines until reset (`ESC[0m`, `ESC c`) or reconnect. Sequences split across reads are handled.
-- `\r`, `\n`, `\v` and `\f` each end a line. Cursor movement across lines, screen clears, OSC/DCS strings, private modes and other sequences are swallowed (they still count for timestamps). Any other control character is shown as `·`. Sequences and lines are length-capped. Foreground colors too close to the background are dropped for legibility.
+- `\r`, `\n`, `\v` and `\f` each end a line. Further line breaks that follow within the silence gap (e.g. the `\n` of `\r\n`) add nothing to the display and are appended to the previous line's raw data in the JSON file. Cursor movement across lines, screen clears, OSC/DCS strings, private modes and other sequences are swallowed (they still count for timestamps). Any other control character is shown as `·`. Sequences and lines are length-capped. Foreground colors too close to the background are dropped for legibility.
 
 ### Output file
 
@@ -113,7 +113,7 @@ Received and sent text is decoded by a per-port ANSI parser (`serser/ansi.py`) a
 - `FILE`: plain text as shown in the output area (no colors), but each line has a full timestamp: `2026-10-18 19:21:11.081 A> hi`. Status and error lines are included.
 - the `.json` file: an array of `{"timestamp", "port", "direction", "data"}` (`direction` is `rx` or `tx`). `data` is the raw text exactly as received or sent, including escape sequences and `\r`/`\n`; concatenating a port's entries per direction gives its stream. Invalid UTF-8 appears as U+FFFD. Status lines are not included. `FILE` itself must not end in `.json`.
 
-The JSON array is closed when serser exits normally; after a kill the file lacks the final `]`.
+Existing files are appended to, never overwritten: the text file gets the new lines at its end, and in an existing JSON file the closing `]` is removed and the new entries are added before a new one, so the array stays valid. If the JSON file does not contain an array (or is an unclosed array from a killed run, which is continued), serser exits with an error where it cannot continue. The array is closed when serser exits normally; after a kill it lacks the final `]`, which the next run repairs.
 
 ## Design
 
