@@ -3,7 +3,7 @@ name = "serser"
 version = "0.1.0"
 description = "Concurrent multi-serial-port reader with timestamped output"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "pyserial-asyncio>=0.6",
     "textual>=4.0",

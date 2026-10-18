@@ -230,6 +230,11 @@ def parse_args() -> argparse.Namespace:
                    help="Minimum silence (ms) that starts a new timestamped line. USB "
                         "serial adapters deliver data in chunks, so keep this above the "
                         "adapter's latency (default: 50).")
+    p.add_argument("-o", "--output", metavar="FILE",
+                   help="Save all traffic of all ports (also disabled ones): plain text "
+                        "with full timestamps to FILE, and an array of {timestamp, port, "
+                        "direction, data} with the raw text to FILE with its extension replaced "
+                        "by .json. Refuses to overwrite existing files.")
     p.add_argument("--color", choices=("auto", "always", "never"), default="auto",
                    help="Colour for piped output: 'always' prints the decoded device "
                         "colours as ANSI; otherwise plain text. The TUI always uses colour.")
@@ -250,6 +255,7 @@ class LogLine:
     arrow: str
     text: str
     spans: tuple[Span, ...] = ()
+    raw: str = ""
 
     @classmethod
     def status(cls, text: str, style: str | None = None) -> "LogLine":
@@ -293,6 +299,7 @@ class LineAssembler:
         self._ts: datetime | None = None
         self._last: datetime | None = None
         self._busy_until: datetime | None = None
+        self._raw: list[str] = []
 
     def feed_bytes(self, raw: bytes, now: datetime | None = None,
                    byte_time: float = 0.0) -> None:
@@ -321,8 +328,11 @@ class LineAssembler:
             self.parser.abort()
             self._decoder.reset()
         self._last = now
+        seg = 0  # start of the part of *text* not yet added to the raw line
         for i, op, a, b in self.parser.feed(text):
             if op == "nl":
+                self._raw.append(text[seg:i + 1])
+                seg = i + 1
                 self.flush()
                 continue
             if self._ts is None:
@@ -335,13 +345,20 @@ class LineAssembler:
             if op != "seq":
                 self.buf.apply(op, a, b)
                 if len(self.buf) >= MAX_LINE:
+                    self._raw.append(text[seg:i + 1])
+                    seg = i + 1
                     self.flush()
+        self._raw.append(text[seg:])
+        if len(self._raw) > 1024:  # escape-only input never emits a line
+            self._raw = ["".join(self._raw)[-65536:]]
 
     def flush(self) -> None:
         if len(self.buf) and self._ts is not None:
             text, spans = self.buf.to_text()
             if text:
-                self._emit_cb(LogLine(self._ts, self.port_name, self.arrow, text, spans))
+                self._emit_cb(LogLine(self._ts, self.port_name, self.arrow, text, spans,
+                                      "".join(self._raw)))
+                self._raw = []
         self.buf.clear()
         self._ts = None
 
@@ -435,6 +452,80 @@ def row_to_ansi(console, text: str, spans: list[Span]) -> str:
         console.print(rich_text, end="", soft_wrap=True, highlight=False, markup=False)
     return capture.get()
 
+# ==== Output file =============================================================
+
+class OutputFile:
+    """Saves every line of every port (enabled or not) to two files.
+
+    *path* gets plain text with full timestamps, *path* with its extension
+    replaced by ``.json`` gets the
+    raw data as a JSON array. Lines are held briefly and written sorted by
+    timestamp, so back-dated received lines land in order (UTC timestamps).
+    """
+
+    def __init__(self, path: str, name_width: int, hold: float = 0.5) -> None:
+        self.width = name_width
+        self.hold = hold
+        json_path = os.path.splitext(path)[0] + ".json"
+        if os.path.abspath(json_path) == os.path.abspath(path):
+            raise ValueError("FILE must not end in .json (that name is used for the JSON output)")
+        self._txt = open(path, "x", encoding="utf-8", newline="\n")  # refuses to overwrite
+        try:
+            self._json = open(json_path, "x", encoding="utf-8", newline="\n")
+        except BaseException:
+            self._txt.close()
+            os.remove(path)
+            raise
+        self._heap: list[tuple[datetime, int, float, LogLine]] = []
+        self._seq = 0
+        self._first = True
+        self._json.write("[")
+
+    def add(self, line: LogLine) -> None:
+        self._seq += 1
+        key = line.ts or datetime.now(timezone.utc)
+        heapq.heappush(self._heap, (key, self._seq, time.monotonic(), line))
+
+    def write_due(self, force: bool = False) -> None:
+        now = time.monotonic()
+        wrote = False
+        while self._heap and (force or self._heap[0][2] + self.hold <= now):
+            key, _, _, line = heapq.heappop(self._heap)
+            self._write(key, line)
+            wrote = True
+        if wrote:
+            self._txt.flush()
+            self._json.flush()
+
+    def _write(self, key: datetime, line: LogLine) -> None:
+        stamp = key.strftime("%Y-%m-%d %H:%M:%S.") + f"{key.microsecond // 1000:03d}"
+        head = f"{line.port.ljust(self.width)}{line.arrow} " if line.port else ""
+        self._txt.write(f"{stamp} {head}{line.text}\n")
+        if line.ts is not None:  # status lines are not traffic
+            import json
+            entry = {"timestamp": key.isoformat(timespec="microseconds"),
+                     "port": line.port,
+                     "direction": "rx" if line.arrow == ">" else "tx",
+                     "data": line.raw}
+            self._json.write(("\n" if self._first else ",\n") + "  "
+                             + json.dumps(entry, ensure_ascii=False))
+            self._first = False
+
+    def close(self) -> None:
+        if self._txt.closed:
+            return
+        self.write_due(force=True)
+        self._json.write("\n]\n" if not self._first else "]\n")
+        self._txt.close()
+        self._json.close()
+
+    async def run(self) -> None:
+        """Periodically write lines whose hold time has passed."""
+        while True:
+            await asyncio.sleep(0.1)
+            self.write_due()
+
+
 # ==== Serial reader task ======================================================
 
 async def _run_reader(
@@ -499,7 +590,8 @@ async def _run_reader(
 
 # ==== Non-TTY fallback ======================================================
 
-async def _run_non_tty(ports_cfg: list[SerialPort], color: str = "auto") -> None:
+async def _run_non_tty(ports_cfg: list[SerialPort], color: str = "auto",
+                       out_file: "OutputFile | None" = None) -> None:
     """Plain stdout mode when redirected/piped.
 
     *color* is ``always`` to print our own SGR colour sequences; ``auto`` and
@@ -522,6 +614,8 @@ async def _run_non_tty(ports_cfg: list[SerialPort], color: str = "auto") -> None
     async def _drain() -> None:
         compact = TimeCompactor()
         async for line in ordered_lines(out_q):
+            if out_file is not None:
+                out_file.add(line)
             for text, spans in render_rows(line, compact, width, prefix_styles.get(line.port)):
                 if console is not None:
                     text = row_to_ansi(console, text, spans)
@@ -529,6 +623,8 @@ async def _run_non_tty(ports_cfg: list[SerialPort], color: str = "auto") -> None
 
     drain_t = asyncio.create_task(_drain())
     all_t = [*reader_tasks, drain_t]
+    if out_file is not None:
+        all_t.append(asyncio.create_task(out_file.run()))
 
     try:
         await asyncio.gather(*all_t)
@@ -757,8 +853,10 @@ Screen { layout: vertical; }
 }
 """
 
-    def __init__(self, ports_config: list[SerialPort]) -> None:
+    def __init__(self, ports_config: list[SerialPort],
+                 out_file: "OutputFile | None" = None) -> None:
         super().__init__()
+        self.out_file = out_file
         self.ports = list(ports_config)
         self.mgr = PortManager(self.ports)
         self.out_q: "asyncio.Queue[LogLine] | None" = None
@@ -796,6 +894,8 @@ Screen { layout: vertical; }
             task = asyncio.create_task(_run_reader(port, self.out_q, self.transport_map))
 
         self.run_worker(self._drain_output())
+        if self.out_file is not None:
+            self.run_worker(self.out_file.run())
         self._refresh_footer()
         self.set_interval(0.5, self._refresh_footer)
 
@@ -842,6 +942,8 @@ Screen { layout: vertical; }
         while True:
             raw = await self.out_q.get()
             seq += 1
+            if self.out_file is not None:
+                self.out_file.add(raw)
             log = self.query_one("#serial-log", Log)
             last = self._entries[-1][0] if self._entries else _UTC_MIN
             key = raw.ts or last
@@ -930,14 +1032,28 @@ def main() -> None:
 
     ports_cfg = parse_ports(args)
 
-    if sys.stdout.isatty():
-        app = SerserTUI(ports_cfg)
-        app.run()
-    else:
+    out_file = None
+    if args.output:
         try:
-            asyncio.run(_run_non_tty(ports_cfg, args.color))
-        except KeyboardInterrupt:
-            print("\nBye.", file=sys.stderr)
+            out_file = OutputFile(args.output, max((len(p.name) for p in ports_cfg), default=0))
+        except FileExistsError:
+            print("Error: output file or its .json counterpart already exists; refusing to overwrite.", file=sys.stderr)
+            sys.exit(1)
+        except (OSError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    try:
+        if sys.stdout.isatty():
+            SerserTUI(ports_cfg, out_file).run()
+        else:
+            try:
+                asyncio.run(_run_non_tty(ports_cfg, args.color, out_file))
+            except KeyboardInterrupt:
+                print("\nBye.", file=sys.stderr)
+    finally:
+        if out_file is not None:
+            out_file.close()
 
 
 if __name__ == "__main__":

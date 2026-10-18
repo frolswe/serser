@@ -72,6 +72,35 @@ class DecoderTests(unittest.TestCase):
                 self.assertTrue(0 <= s <= e <= len(l.text))
 
 
+class OutputFileTests(unittest.TestCase):
+    def test_both_files(self):
+        import json, tempfile
+        from serser.main import OutputFile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "log.txt")
+            out = []
+            asm = LineAssembler(FakePort(), ">", out.append)
+            asm.feed_bytes(b"\x1b[31ma\r\nb\n")
+            asm.flush()
+            f = OutputFile(path, 1, hold=0)
+            for l in out:
+                f.add(l)
+            f.close()
+            data = json.load(open(os.path.join(d, "log.json")))
+            self.assertEqual("".join(e["data"] for e in data), "\x1b[31ma\r\nb\n")
+            self.assertEqual(data[0]["direction"], "rx")
+            lines = open(path).read().splitlines()
+            self.assertEqual([l.split(" ", 2)[2] for l in lines], ["P> a", "P> b"])
+            with self.assertRaises(FileExistsError):
+                OutputFile(path, 1)
+            os.remove(path)
+            with self.assertRaises(FileExistsError):
+                OutputFile(path, 1)
+            self.assertFalse(os.path.exists(path))
+            with self.assertRaises(ValueError):
+                OutputFile(os.path.join(d, "x.json"), 1)
+
+
 class TimingTests(unittest.TestCase):
     def test_escape_bytes_count_for_timestamp(self):
         from datetime import datetime, timezone
