@@ -4,16 +4,19 @@
 import argparse
 import asyncio
 import bisect
+import codecs
 import heapq
 import os
 import platform as _platform_mod
 import re
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 try:
     from textual.app import App, ComposeResult
+    from rich.style import Style
     from rich.text import Text
     from textual.binding import Binding
     from textual.geometry import Offset
@@ -24,6 +27,8 @@ try:
 except ImportError:
     print("ERROR: textual is required. Install with: pip install textual")
     raise SystemExit(1)
+
+from serser.ansi import MAX_LINE, AnsiParser, LineBuffer, Span, scrub
 
 
 # ==== Domain model ============================================================
@@ -225,87 +230,130 @@ def parse_args() -> argparse.Namespace:
                    help="Minimum silence (ms) that starts a new timestamped line. USB "
                         "serial adapters deliver data in chunks, so keep this above the "
                         "adapter's latency (default: 50).")
+    p.add_argument("--color", choices=("auto", "always", "never"), default="auto",
+                   help="Colour for piped output: 'always' prints the decoded device "
+                        "colours as ANSI; otherwise plain text. The TUI always uses colour.")
     return p.parse_intermixed_args()
 
 
 # ==== Line assembly ==========================================================
 
-_ANSI_RE = re.compile(
-    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"   # OSC
-    r"|\x1b[PX^_][^\x1b]*\x1b\\"           # DCS/SOS/PM/APC
-    r"|\x1b\[[0-?]*[ -/]*[@-~]"               # CSI
-    r"|\x1b[@-Z\\-_ -/]*[0-~]?"               # other escapes
-)
-_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+@dataclass(frozen=True)
+class LogLine:
+    """One finished line: full timestamp, origin, plain text and style spans.
+
+    Status and error messages have no timestamp (``ts is None``) and no port.
+    """
+
+    ts: datetime | None
+    port: str
+    arrow: str
+    text: str
+    spans: tuple[Span, ...] = ()
+
+    @classmethod
+    def status(cls, text: str, style: str | None = None) -> "LogLine":
+        text = scrub(text)
+        spans = ((0, len(text), Style.parse(style)),) if style and text else ()
+        return cls(None, "", "", text, spans)
 
 
-def sanitize(text: str) -> str:
-    """Drop ANSI escape sequences and make other control characters harmless."""
-    return _CTRL_RE.sub("\u00b7", _ANSI_RE.sub("", text))
+_UTC_MIN = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _byte_offsets(text: str) -> tuple["range | list[int]", int]:
+    """UTF-8 byte offset of every character, and the total byte count."""
+    if text.isascii():
+        return range(len(text)), len(text)
+    offsets, pos = [], 0
+    for ch in text:
+        offsets.append(pos)
+        pos += len(ch.encode("utf-8", "replace"))
+    return offsets, pos
+
 
 class LineAssembler:
     """Groups one direction of one port's traffic into timestamped lines.
 
-    A new timestamp starts after a silence gap or a newline; the line is
-    flushed when a newline arrives or when the next burst begins.
+    Text is decoded by an :class:`AnsiParser`, so colours, simple line edits and
+    swallowed control sequences are handled before a line is emitted. A new
+    timestamp starts after a silence gap or a line break; the line is flushed
+    when a break arrives or when the next burst begins. ``\\r`` and ``\\n`` both
+    end a line.
     """
 
-    def __init__(self, port: SerialPort, arrow: str, emit, name_width: int = 0) -> None:
-        self.prefix = f"{port.name.ljust(name_width)}{arrow}"
+    def __init__(self, port: SerialPort, arrow: str, emit) -> None:
+        self.port_name = port.name
+        self.arrow = arrow
         self.timeout = port.silence_timeout
         self._emit_cb = emit
-        self.buf: list[str] = []
+        self.parser = AnsiParser()
+        self.buf = LineBuffer()
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._ts: datetime | None = None
         self._last: datetime | None = None
         self._busy_until: datetime | None = None
+
+    def feed_bytes(self, raw: bytes, now: datetime | None = None,
+                   byte_time: float = 0.0) -> None:
+        """Feed received bytes (a character split across chunks is kept whole)."""
+        now = now or datetime.now(timezone.utc)
+        self.feed(self._decoder.decode(raw), now, byte_time)
 
     def feed(self, text: str, now: datetime | None = None, byte_time: float = 0.0,
              forward: bool = False) -> None:
         """Add *text* that arrived (or, with *forward*, is being sent) at *now*.
 
-        With *byte_time* > 0 each character's timestamp is estimated assuming
-        back-to-back bytes. Received data counts back from the chunk's arrival
-        (an upper bound, never before the previous chunk). Sent data counts
-        forward from the start of transmission (a lower bound), where a send
-        queued behind an unfinished one starts when that one ends.
+        With *byte_time* > 0 each line's start is estimated assuming back-to-back
+        bytes (escape sequences count as bytes). Received data counts back from
+        the chunk's arrival (an upper bound, never before the previous chunk).
+        Sent data counts forward from the start of transmission (a lower bound),
+        where a send queued behind an unfinished one starts when that one ends.
         """
         now = now or datetime.now(timezone.utc)
-        n = len(text)
+        offsets, n = _byte_offsets(text)
         if forward:
             start = max(now, self._busy_until) if self._busy_until else now
             self._busy_until = start + timedelta(seconds=n * byte_time)
-        floor = prev = self._last
-        for i, ch in enumerate(text):
-            if prev is not None and (now - prev).total_seconds() > self.timeout:
+        floor = self._last
+        if floor is not None and (now - floor).total_seconds() > self.timeout:
+            self.flush()
+            self.parser.abort()
+            self._decoder.reset()
+        self._last = now
+        for i, op, a, b in self.parser.feed(text):
+            if op == "nl":
                 self.flush()
-            self._last = prev = now
-            if ch == '\n':
-                self.flush()
-            elif ch != '\r':
-                if self._ts is None:
-                    if forward:
-                        self._ts = start + timedelta(seconds=i * byte_time)
-                    else:
-                        ts = now - timedelta(seconds=(n - i) * byte_time)
-                        self._ts = max(ts, floor) if floor else ts
-                self.buf.append(ch)
+                continue
+            if self._ts is None:
+                off = offsets[i]
+                if forward:
+                    self._ts = start + timedelta(seconds=off * byte_time)
+                else:
+                    ts = now - timedelta(seconds=(n - off) * byte_time)
+                    self._ts = max(ts, floor) if floor else ts
+            if op != "seq":
+                self.buf.apply(op, a, b)
+                if len(self.buf) >= MAX_LINE:
+                    self.flush()
 
     def flush(self) -> None:
-        if self.buf and self._ts is not None:
-            t = self._ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
-            self._emit_cb(f"[{t}] {self.prefix} {sanitize(''.join(self.buf))}\n")
+        if len(self.buf) and self._ts is not None:
+            text, spans = self.buf.to_text()
+            if text:
+                self._emit_cb(LogLine(self._ts, self.port_name, self.arrow, text, spans))
         self.buf.clear()
         self._ts = None
 
 
-async def ordered_lines(q: "asyncio.Queue[str]", hold: float = 0.25):
-    """Yield queued lines sorted by their leading timestamp.
+async def ordered_lines(q: "asyncio.Queue[LogLine]", hold: float = 0.25):
+    """Yield queued lines sorted by timestamp.
 
     Each line is held for *hold* seconds so that lines from other ports or
     directions with earlier timestamps (back-dated rx, forward-dated tx) can
     still overtake it. Lines without a timestamp sort by arrival.
     """
-    heap: list[tuple[str, int, float, str]] = []
+    heap: list[tuple[datetime, int, float, LogLine]] = []
     seq = 0
     loop = asyncio.get_running_loop()
     while True:
@@ -318,15 +366,10 @@ async def ordered_lines(q: "asyncio.Queue[str]", hold: float = 0.25):
             line = None
         if line is not None:
             seq += 1
-            key = line[1:24] if line.startswith("[2") else ""
-            if not key and heap:
-                key = max(h[0] for h in heap)
+            key = line.ts or max((h[0] for h in heap), default=_UTC_MIN)
             heapq.heappush(heap, (key, seq, loop.time(), line))
         while heap and heap[0][2] + hold <= loop.time():
             yield heapq.heappop(heap)[3]
-
-
-_TS_RE = re.compile(r"^\[(\d{4}-\d\d-\d\d)T(\d\d):(\d\d):(\d\d)\.(\d{3})\] (.*)$", re.S)
 
 
 class TimeCompactor:
@@ -340,35 +383,64 @@ class TimeCompactor:
         self._date: str | None = None
         self._prev: tuple[str, ...] | None = None
 
-    def format(self, line: str) -> list[str]:
-        m = _TS_RE.match(line.rstrip("\n"))
-        if not m:
-            return [line.rstrip("\n")]
-        date, *parts, text = m.groups()
-        out = []
+    def stamp(self, ts: datetime) -> tuple[str | None, str]:
+        """Return (date line or None, shortened clock text) for *ts*."""
+        date = ts.strftime("%Y-%m-%d")
+        parts = (ts.strftime("%H"), ts.strftime("%M"), ts.strftime("%S"),
+                 f"{ts.microsecond // 1000:03d}")
+        new_date = None
         if date != self._date:
-            out.append(date)
-            self._date = date
-            self._prev = None
+            new_date, self._date, self._prev = date, date, None
         clock = f"{parts[0]}:{parts[1]}:{parts[2]}.{parts[3]}"
         blank = 0
         if self._prev is not None:
-            for i, width in enumerate((3, 3, 3)):  # "HH:", "MM:", "SS."
+            for i in range(3):  # "HH:", "MM:", "SS."
                 if parts[i] != self._prev[i]:
                     break
-                blank += width
-        self._prev = tuple(parts)
-        out.append(f"{' ' * blank}{clock[blank:]} {text}")
-        return out
+                blank += 3
+        self._prev = parts
+        return new_date, " " * blank + clock[blank:]
 
+
+Row = tuple[str, list[Span]]
+
+
+def render_rows(line: LogLine, compact: TimeCompactor, name_width: int,
+                prefix_style: Style | None = None) -> list[Row]:
+    """Display rows (text plus style spans) for *line*, advancing *compact*."""
+    if line.ts is None:
+        return [(line.text, list(line.spans))] if line.text else []
+    date, clock = compact.stamp(line.ts)
+    rows: list[Row] = []
+    if date:
+        rows.append((date, []))
+    name = line.port.ljust(name_width)
+    head = f"{clock} {name}{line.arrow} "
+    spans: list[Span] = []
+    if prefix_style is not None:
+        begin = len(clock) + 1
+        spans.append((begin, begin + len(name) + len(line.arrow), prefix_style))
+    off = len(head)
+    spans.extend((s + off, e + off, st) for s, e, st in line.spans)
+    rows.append((head + line.text, spans))
+    return rows
+
+
+def row_to_ansi(console, text: str, spans: list[Span]) -> str:
+    """Render one row with our own SGR sequences (never the device's bytes)."""
+    rich_text = Text(text, no_wrap=True)
+    for start, end, style in spans:
+        rich_text.stylize(style, start, end)
+    with console.capture() as capture:
+        console.print(rich_text, end="", soft_wrap=True, highlight=False, markup=False)
+    return capture.get()
 
 # ==== Serial reader task ======================================================
 
 async def _run_reader(
     port: SerialPort, 
-    out_q: asyncio.Queue[str],
+    out_q: "asyncio.Queue[LogLine]",
     transports: dict[str, asyncio.BaseTransport] | None = None,
-    name_width: int = 0,
 ) -> asyncio.Transport | None:
     """Open *port*, push timestamped lines to *out_q* until cancelled.
 
@@ -380,19 +452,20 @@ async def _run_reader(
     class _ReadProto(asyncio.Protocol):
         def __init__(self) -> None:
             self.transport: asyncio.BaseTransport | None = None
-            self.rx = LineAssembler(port, ">", out_q.put_nowait, name_width)
+            self.rx = LineAssembler(port, ">", out_q.put_nowait)
 
         def connection_made(self, transport) -> None:  # type: ignore[override]
             self.transport = transport
             if transports is not None:
                 transports[port.name] = transport
             gap_ms = port.silence_timeout * 1000
-            out_q.put_nowait(f"[dim][INFO] {port.name} @ {port.baudrate} {port.framing} "
-                             f"(gap:{gap_ms:.0f}ms)[/dim]\n")
+            out_q.put_nowait(LogLine.status(
+                f"[INFO] {port.name} @ {port.baudrate} {port.framing} (gap:{gap_ms:.0f}ms)",
+                "dim"))
 
         def data_received(self, raw: bytes) -> None:
             if raw:
-                self.rx.feed(raw.decode("utf-8", errors="replace"), byte_time=port.byte_time)
+                self.rx.feed_bytes(raw, byte_time=port.byte_time)
 
         def flush_remainder(self) -> None:
             """Flush buffer before disconnecting."""
@@ -407,7 +480,7 @@ async def _run_reader(
             parity=port.parity, stopbits=port.stopbits, loop=loop,
         )
     except Exception as exc:
-        out_q.put_nowait(f"[red][ERROR] {port.device}: {exc}[/red]\n")  
+        out_q.put_nowait(LogLine.status(f"[ERROR] {port.device}: {exc}", "red"))
         return None
 
     try:
@@ -426,19 +499,33 @@ async def _run_reader(
 
 # ==== Non-TTY fallback ======================================================
 
-async def _run_non_tty(ports_cfg: list[SerialPort]) -> None:
-    """Plain stdout mode when redirected/piped."""
-    out_q: asyncio.Queue[str] = asyncio.Queue()
+async def _run_non_tty(ports_cfg: list[SerialPort], color: str = "auto") -> None:
+    """Plain stdout mode when redirected/piped.
+
+    *color* is ``always`` to print our own SGR colour sequences; ``auto`` and
+    ``never`` print plain text (stdout is not a terminal here).
+    """
+    out_q: "asyncio.Queue[LogLine]" = asyncio.Queue()
     width = max((len(p.name) for p in ports_cfg), default=0)
-    reader_tasks = [asyncio.create_task(_run_reader(p, out_q, name_width=width))
-                    for p in ports_cfg]
+    reader_tasks = [asyncio.create_task(_run_reader(p, out_q)) for p in ports_cfg]
+
+    console = None
+    prefix_styles: dict[str, Style] = {}
+    if color == "always":
+        from rich.console import Console
+        console = Console(force_terminal=True, color_system="truecolor",
+                          file=open(os.devnull, "w"), width=10_000)
+        mgr = PortManager(ports_cfg)
+        prefix_styles = {p.name: Style.parse(mgr.vibrant_style_for(p.name) or "")
+                         for p in ports_cfg}
 
     async def _drain() -> None:
-        while True:
-            compact = TimeCompactor()
-            async for line in ordered_lines(out_q):
-                for row in compact.format(line):
-                    print(row, flush=True)
+        compact = TimeCompactor()
+        async for line in ordered_lines(out_q):
+            for text, spans in render_rows(line, compact, width, prefix_styles.get(line.port)):
+                if console is not None:
+                    text = row_to_ansi(console, text, spans)
+                print(text, flush=True)
 
     drain_t = asyncio.create_task(_drain())
     all_t = [*reader_tasks, drain_t]
@@ -471,20 +558,31 @@ class SendArea(TextArea):
             await super()._on_key(event)
 
 
-_LINE_PORT_RE = re.compile(r"^\[[^\]]*\] (\S+) *[<>] ")
-_PREFIX_RE = re.compile(r"^[\d:. ]*(\S+) *([<>]) ")
+_MIN_CONTRAST = 40
 
 
-class _PortHighlighter:
-    """Colors the `port>` / `port<` prefix of each log line by port."""
+def _luma(color) -> float:
+    r, g, b = color.get_truecolor()
+    return 0.299 * r + 0.587 * g + 0.114 * b
 
-    def __init__(self, style_for) -> None:
-        self._style_for = style_for
+
+class _SpanHighlighter:
+    """Applies the stored style spans of the row being rendered."""
+
+    def __init__(self, log: "OutputLog") -> None:
+        self._log = log
 
     def __call__(self, text):
-        m = _PREFIX_RE.match(text.plain)
-        if m and (style := self._style_for(m.group(1))):
-            text.stylize(style, m.start(1), m.end(2))
+        log = self._log
+        y = log._render_y
+        if y is None or not 0 <= y < len(log._row_spans):
+            return text
+        bg = log._bg_luma
+        for start, end, style in log._row_spans[y]:
+            if bg is not None and style.color is not None and not style.reverse \
+                    and abs(_luma(style.color) - bg) < _MIN_CONTRAST:
+                style = style + Style(color="default")
+            text.stylize(style, start, end)
         return text
 
 
@@ -497,6 +595,36 @@ class OutputLog(Log):
     _chain = 1
     _selection: Selection | None = None
     _last_down: tuple[float, tuple[int, int]] | None = None
+    _render_y: int | None = None
+    _bg_luma: float | None = None
+
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs["highlight"] = True
+        super().__init__(*args, **kwargs)
+        self._row_spans: list[list[Span]] = []
+        self.highlighter = _SpanHighlighter(self)
+
+    def write_rows(self, rows: list[Row]) -> None:
+        """Append rows of (plain text, style spans)."""
+        if not rows:
+            return
+        self.write_lines([t for t, _ in rows])
+        self._row_spans.extend(sp for _, sp in rows)
+        extra = len(self._row_spans) - len(self._lines)
+        if extra > 0:
+            del self._row_spans[:extra]
+
+    def clear(self):
+        self._row_spans.clear()
+        return super().clear()
+
+    def _render_line_strip(self, y, rich_style):
+        self._render_y = y
+        try:
+            self._bg_luma = _luma(rich_style.bgcolor) if rich_style.bgcolor else None
+        except Exception:
+            self._bg_luma = None
+        return super()._render_line_strip(y, rich_style)
 
     def _span(self, row: int, col: int, chain: int) -> tuple[int, int]:
         """Word (chain 2) or whole line (chain 3) around *col*; empty span on blanks."""
@@ -633,17 +761,18 @@ Screen { layout: vertical; }
         super().__init__()
         self.ports = list(ports_config)
         self.mgr = PortManager(self.ports)
-        self.out_q: asyncio.Queue[str] | None = None
+        self.out_q: "asyncio.Queue[LogLine] | None" = None
         self._scroll_pending = False
         self.transport_map: dict[str, asyncio.BaseTransport] = {}
-        self._entries: list[tuple[str, int, str]] = []  # (full timestamp, seq, raw line)
+        self._entries: list[tuple[datetime, int, LogLine]] = []  # (sort key, seq, line)
         self._compact = TimeCompactor()
-        self._last_vis: tuple[str, int, str] | None = None
+        self._last_vis: tuple[datetime, int, LogLine] | None = None
         self.name_width = max((len(p.name) for p in self.ports), default=0)
-        self.tx = {p.name: LineAssembler(p, "<", self._emit_line, self.name_width)
-                   for p in self.ports}
+        self.tx = {p.name: LineAssembler(p, "<", self._emit_line) for p in self.ports}
+        self._prefix = {p.name: Style.parse(self.mgr.vibrant_style_for(p.name) or "")
+                        for p in self.ports}
 
-    def _emit_line(self, line: str) -> None:
+    def _emit_line(self, line: LogLine) -> None:
         assert self.out_q is not None
         self.out_q.put_nowait(line)
 
@@ -659,36 +788,25 @@ Screen { layout: vertical; }
     # startup wiring  
     def on_mount(self) -> None:
         self.out_q = asyncio.Queue()
-        self.query_one("#serial-log", Log).highlighter = _PortHighlighter(self.mgr.vibrant_style_for)
         self.query_one("#send-input").focus()
         
         import serial_asyncio as _  # prime the module
         
         for port in self.ports:
-            task = asyncio.create_task(_run_reader(port, self.out_q, self.transport_map, self.name_width))
+            task = asyncio.create_task(_run_reader(port, self.out_q, self.transport_map))
 
         self.run_worker(self._drain_output())
         self._refresh_footer()
         self.set_interval(0.5, self._refresh_footer)
 
-    @staticmethod
-    def _display_rows(compact: "TimeCompactor", raw: str) -> list[str]:
-        rows = []
-        for part in compact.format(raw):
-            if not part:
-                continue
-            # Log shows plain text (selectable); strip markup from status/error lines only.
-            if part.startswith(("[dim]", "[red]")):
-                part = Text.from_markup(part).plain
-            rows.append(part)
-        return rows
+    def _display_rows(self, compact: "TimeCompactor", line: LogLine) -> list[Row]:
+        return render_rows(line, compact, self.name_width, self._prefix.get(line.port))
 
-    def _is_visible(self, entry: tuple[str, int, str]) -> bool:
-        m = _LINE_PORT_RE.match(entry[2])
-        port = self.mgr.ports.get(m.group(1)) if m else None
+    def _is_visible(self, entry) -> bool:
+        port = self.mgr.ports.get(entry[2].port)
         return port is None or port.enabled
 
-    def _rows_for(self, entries) -> list[str]:
+    def _rows_for(self, entries) -> list[Row]:
         compact = TimeCompactor()
         return [r for e in entries if self._is_visible(e)
                 for r in self._display_rows(compact, e[2])]
@@ -703,7 +821,7 @@ Screen { layout: vertical; }
         at_end = log.scroll_y >= log.max_scroll_y
         rows = self._rows_for(self._entries)
         log.clear()
-        log.write_lines(rows)
+        log.write_rows(rows)
         self._compact = TimeCompactor()
         for e in self._entries:
             if self._is_visible(e):
@@ -725,15 +843,15 @@ Screen { layout: vertical; }
             raw = await self.out_q.get()
             seq += 1
             log = self.query_one("#serial-log", Log)
-            last = self._entries[-1][0] if self._entries else ""
-            key = raw[1:24] if raw.startswith("[2") else last
+            last = self._entries[-1][0] if self._entries else _UTC_MIN
+            key = raw.ts or last
             entry = (key, seq, raw)
             visible = self._is_visible(entry)
             if self._last_vis is None or entry >= self._last_vis:
                 bisect.insort(self._entries, entry)
                 if visible:
                     self._last_vis = entry
-                    log.write_lines(self._display_rows(self._compact, raw))
+                    log.write_rows(self._display_rows(self._compact, raw))
             else:
                 old_y, old_count = log.scroll_y, len(log.lines)
                 pos = bisect.bisect(self._entries, entry)
@@ -779,7 +897,7 @@ Screen { layout: vertical; }
         port = self.mgr.active_port
         transport = self.transport_map.get(port.name) if port else None
         if port is None or transport is None:
-            self._emit_line("[red][ERROR] no open port to send to[/red]\n")
+            self._emit_line(LogLine.status("[ERROR] no open port to send to", "red"))
             return
 
         payload = "".join(line + "\n" for line in text.splitlines())
@@ -817,7 +935,7 @@ def main() -> None:
         app.run()
     else:
         try:
-            asyncio.run(_run_non_tty(ports_cfg))
+            asyncio.run(_run_non_tty(ports_cfg, args.color))
         except KeyboardInterrupt:
             print("\nBye.", file=sys.stderr)
 

@@ -69,6 +69,7 @@ serser --default-baud 9600 /dev/ttyS0 /dev/ttyS1
 | `--baud RATE` | `-b` *(repeatable)* | — | Baud rate for ports without inline baud, in order |
 | `--default-baud NUM` | — | `115200` | Fallback baud rate when nothing else is specified |
 | `--gap-ms MS` | — | `50` | Minimum silence that starts a new timestamped line (USB adapters deliver data in chunks) |
+| `--color auto\|always\|never` | — | `auto` | Piped output only: `always` prints the decoded device colors as ANSI; otherwise plain text. The TUI always shows colors |
 
 ## Output Format
 
@@ -96,7 +97,10 @@ Internally every line keeps its full timestamp (used for ordering); only the dis
 
 Each port tracks its own buffer and timestamps independently, and so does each direction of a port: received data is prefixed `port>` and sent data `port<`, each with its own burst/gap tracking.
 - **Focus**: the input box always keeps the cursor; clicking or selecting in the log never moves focus, so typing always goes to the input (selecting and Ctrl+C still copy from the log).
-- **Control codes**: ANSI escape sequences (colors, cursor moves, OSC titles) are stripped from received and sent text, and other control characters are shown as `·`, so device output can't corrupt the TUI or your terminal.
+- **Colors and control codes**: received (and sent) text is decoded by a per-port ANSI parser (`serser/ansi.py`) and re-rendered by serser, so the device's bytes never reach your terminal.
+  - Supported: SGR colors and attributes (16/256/truecolor, bold, dim, italic, underline, reverse, strike; blink/conceal ignored), `\b`, tab, and the in-line edits `ESC[nC/D/G`, `K`, `P`, `X`.
+  - Color state is kept per port and direction and persists across lines until reset (`ESC[0m`, `ESC c`) or reconnect. Sequences split across reads are handled.
+  - `\r`, `\n`, `\v` and `\f` each end a line. Cursor movement across lines, screen clears, OSC/DCS strings, private modes and other sequences are swallowed (they still count for timestamps). Any other control character is shown as `·`. Sequences and lines are length-capped. Foreground colors too close to the background are dropped for legibility.
 - **Ordering**: because rx is back-dated and tx forward-dated, a line can arrive after lines with later timestamps. In the TUI lines are shown immediately and a late line is inserted at its timestamp position (the log is redrawn, last 1000 lines kept; if you were at the bottom it stays scrolled to the end, otherwise the same content stays in view). Piped output cannot be rewritten, so it holds lines for 250 ms and prints them sorted.
 
 ## Design
@@ -145,7 +149,14 @@ serial log widget   ← append line + scroll
 | `SerialPort` | Device path, baud rate, silence timeout (`5 × 10 / baudrate`) |
 | `PortManager` | List of ports, active index, `cycle_active()` on Tab |
 | `LineAssembler` | One per port and direction (`>` rx, `<` tx); applies silence/newline logic and emits timestamped, prefixed lines |
+| `AnsiParser` / `LineBuffer` (`ansi.py`) | Per-port escape decoding state machine and styled single-line buffer |
 | `_run_reader()` | One asyncio task per port; Protocol feeds received bytes to its rx `LineAssembler` and registers the transport for sending |
-| Shared output queue | Single `asyncio.Queue[str]`; guarantees ordered, non-interleaved main-thread rendering |
+| Shared output queue | Single `asyncio.Queue[LogLine]`; guarantees ordered, non-interleaved main-thread rendering |
 | Textual drain worker | Awaits queue on main thread, appends each line to the log widget |
 | Textual `TextArea` (`SendArea`) | Multi-line input; Tab cycles port, Enter sends all lines to active port's transport, Shift+Enter inserts a newline |
+
+## Tests
+
+```
+python -m unittest discover -s tests
+```
